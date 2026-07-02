@@ -7,14 +7,13 @@ import { spawn } from "node:child_process";
 import { access, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-const CENTRAL_REPO = {
-  name: "gtwy-ai",
-  url: "https://github.com/Walkover-Web-Solution/gtwy-ai",
-  description: "Central repo (always included)",
-  required: true,
-};
-
-const OPTIONAL_REPOS = [
+// All repos are optional and chosen by the user (gtwy-ai included).
+const REPOS = [
+  {
+    name: "gtwy-ai",
+    url: "https://github.com/Walkover-Web-Solution/gtwy-ai",
+    description: "AI service",
+  },
   {
     name: "gtwy-node",
     url: "https://github.com/Walkover-Web-Solution/gtwy-node",
@@ -32,50 +31,14 @@ const OPTIONAL_REPOS = [
   },
 ];
 
-const AGENTS_MD_CONTENT = `<!-- code-review-graph MCP tools -->
-## MCP Tools: code-review-graph
-
-**IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
-the codebase.** The graph is faster, cheaper (fewer tokens), and gives
-you structural context (callers, dependents, test coverage) that file
-scanning cannot.
-
-### When to use graph tools FIRST
-
-- **Exploring code**: \`semantic_search_nodes\` or \`query_graph\` instead of Grep
-- **Understanding impact**: \`get_impact_radius\` instead of manually tracing imports
-- **Code review**: \`detect_changes\` + \`get_review_context\` instead of reading entire files
-- **Finding relationships**: \`query_graph\` with callers_of/callees_of/imports_of/tests_for
-- **Architecture questions**: \`get_architecture_overview\` + \`list_communities\`
-
-Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
-
-### Key Tools
-
-| Tool | Use when |
-|------|----------|
-| \`detect_changes\` | Reviewing code changes — gives risk-scored analysis |
-| \`get_review_context\` | Need source snippets for review — token-efficient |
-| \`get_impact_radius\` | Understanding blast radius of a change |
-| \`get_affected_flows\` | Finding which execution paths are impacted |
-| \`query_graph\` | Tracing callers, callees, imports, tests, dependencies |
-| \`semantic_search_nodes\` | Finding functions/classes by name or keyword |
-| \`get_architecture_overview\` | Understanding high-level codebase structure |
-| \`refactor_tool\` | Planning renames, finding dead code |
-
-### Workflow
-
-1. The graph auto-updates on file changes (via hooks).
-2. Use \`detect_changes\` for code review.
-3. Use \`get_affected_flows\` to understand impact.
-4. Use \`query_graph\` pattern="tests_for" to check coverage.
-`;
-
-async function writeAgentsMd(repoDir) {
-  const filePath = path.join(repoDir, "AGENTS.md");
-  await writeFile(filePath, AGENTS_MD_CONTENT, "utf8");
-}
+// Central repo that holds per-repo markdown docs under `<root>/<repo-name>/`.
+// This repo is NOT cloned — we only pull the relevant .md files from it.
+const CENTRAL_DOCS = {
+  owner: "kabir74705",
+  repo: "CENTRAL_REPO",
+  branch: "master",
+  root: "gtwy",
+};
 
 function printBanner() {
   console.log();
@@ -145,13 +108,68 @@ async function cloneRepo(repo, targetDir) {
   return dest;
 }
 
+async function fetchGithubJson(url) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "walkover-onboard-cli",
+      Accept: "application/vnd.github+json",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`GitHub API ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// Pull everything under `<root>/<repoName>/` from the central repo (AGENTS.md
+// plus the docs/ folder) and mirror the same structure into the freshly cloned
+// repo directory (adding new files or replacing existing).
+async function copyDocsForRepo(repoName, repoDir) {
+  const { owner, repo, branch, root } = CENTRAL_DOCS;
+
+  // Resolve the branch tip, then read the full tree recursively so we pick up
+  // nested folders (e.g. docs/) without walking the contents API level by level.
+  const branchInfo = await fetchGithubJson(
+    `https://api.github.com/repos/${owner}/${repo}/branches/${branch}`
+  );
+  const treeSha = branchInfo.commit.commit.tree.sha;
+  const treeData = await fetchGithubJson(
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${treeSha}?recursive=1`
+  );
+
+  const prefix = `${root}/${repoName}/`;
+  const files = (treeData.tree || []).filter(
+    (entry) => entry.type === "blob" && entry.path.startsWith(prefix)
+  );
+
+  const written = [];
+  for (const file of files) {
+    const relPath = file.path.slice(prefix.length);
+    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
+
+    const res = await fetch(rawUrl, {
+      headers: { "User-Agent": "walkover-onboard-cli" },
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to download ${relPath}: ${res.status}`);
+    }
+    const content = await res.text();
+
+    const dest = path.join(repoDir, relPath);
+    await mkdir(path.dirname(dest), { recursive: true });
+    await writeFile(dest, content, "utf8");
+    written.push(relPath);
+  }
+  return written;
+}
+
 async function main() {
   printBanner();
   await ensureGitInstalled();
 
   const selectedNames = await checkbox({
-    message: "Select optional repos (gtwy-ai is always included):",
-    choices: OPTIONAL_REPOS.map((repo) => ({
+    message: "Select the repos you need:",
+    choices: REPOS.map((repo) => ({
       name: repo.name,
       value: repo.name,
       description: repo.description,
@@ -161,29 +179,22 @@ async function main() {
     loop: false,
   });
 
-  const selectedOptional = OPTIONAL_REPOS.filter((repo) =>
+  const selectedRepos = REPOS.filter((repo) =>
     selectedNames.includes(repo.name)
   );
 
-  if (selectedOptional.length === 0) {
-    const onlyCentral = await confirm({
-      message:
-        "No optional repos selected. Continue with only gtwy-ai?",
-      default: false,
-    });
-    if (!onlyCentral) {
-      console.log(chalk.dim("\n  Cancelled. Run again and press SPACE to select repos.\n"));
-      process.exit(0);
-    }
-  } else {
+  if (selectedRepos.length === 0) {
     console.log(
-      chalk.dim(
-        `\n  Optional repos selected: ${selectedOptional.map((r) => r.name).join(", ")}\n`
-      )
+      chalk.dim("\n  No repos selected. Run again and press SPACE to select.\n")
     );
+    process.exit(0);
   }
 
-  const reposToClone = [CENTRAL_REPO, ...selectedOptional];
+  console.log(
+    chalk.dim(
+      `\n  Selected: ${selectedRepos.map((r) => r.name).join(", ")}\n`
+    )
+  );
 
   const defaultParent = path.join(process.cwd(), "walkover-repos");
   const parentInput = await input({
@@ -198,9 +209,8 @@ async function main() {
   console.log(chalk.cyan(`    ${parentDir}`));
   console.log();
   console.log(chalk.bold("  Folder structure:"));
-  for (const repo of reposToClone) {
-    const suffix = repo.required ? chalk.yellow(" (required)") : "";
-    console.log(`    ${chalk.green("•")} ${repo.name}/${suffix}`);
+  for (const repo of selectedRepos) {
+    console.log(`    ${chalk.green("•")} ${repo.name}/`);
   }
   console.log();
 
@@ -218,15 +228,37 @@ async function main() {
 
   const results = [];
 
-  for (const repo of reposToClone) {
-    const spinner = ora(`Cloning ${chalk.cyan(repo.name)} into parent folder...`).start();
+  for (const repo of selectedRepos) {
+    const spinner = ora(
+      `Cloning ${chalk.cyan(repo.name)} into parent folder...`
+    ).start();
     try {
       const clonedPath = await cloneRepo(repo, parentDir);
       spinner.succeed(`Cloned ${chalk.cyan(repo.name)} → ${clonedPath}`);
 
-      const agentsSpinner = ora({ text: `Adding ${chalk.magenta("AGENTS.md")} to ${chalk.cyan(repo.name)}...`, prefixText: "  " }).start();
-      await writeAgentsMd(clonedPath);
-      agentsSpinner.succeed(`Added ${chalk.magenta("AGENTS.md")} → ${clonedPath}`);
+      const docsSpinner = ora({
+        text: `Fetching docs for ${chalk.cyan(repo.name)} from central repo...`,
+        prefixText: "  ",
+      }).start();
+      try {
+        const docs = await copyDocsForRepo(repo.name, clonedPath);
+        if (docs.length > 0) {
+          docsSpinner.succeed(
+            `Added ${docs.length} doc file(s) to ${chalk.cyan(repo.name)}`
+          );
+          for (const rel of docs) {
+            console.log(chalk.dim(`      + ${rel}`));
+          }
+        } else {
+          docsSpinner.warn(
+            `No docs found for ${chalk.cyan(repo.name)} in central repo`
+          );
+        }
+      } catch (docErr) {
+        docsSpinner.fail(
+          `Could not fetch docs for ${chalk.cyan(repo.name)}: ${docErr.message}`
+        );
+      }
 
       results.push({ repo, success: true, path: clonedPath });
     } catch (err) {
