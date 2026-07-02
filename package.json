@@ -1,0 +1,22 @@
+{
+  "name": "walkover-onboard",
+  "version": "1.0.0",
+  "description": "CLI to help new Walkover onboardings clone the repos they need",
+  "bin": {
+    "walkover-onboard": "./bin/walkover-onboard.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["onboarding", "cli", "walkover"],
+  "license": "MIT",
+  "scripts": {
+    "start": "node bin/walkover-onboard.js"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.5.1",
+    "chalk": "^5.4.1",
+    "ora": "^8.2.0"
+  }
+}
