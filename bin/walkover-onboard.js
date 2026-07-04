@@ -376,8 +376,27 @@ async function main() {
       }
     }
   } finally {
-    // Step 3: remove the temporary central clone.
-   
+    // Step 3: copy the workspace-level AGENTS.md (CENTRAL_REPO/gtwy/AGENTS.md → walkover-repos/AGENTS.md).
+    if (centralRepoPath) {
+      const globalAgentsSrc = path.join(centralRepoPath, CENTRAL.root, "AGENTS.md");
+      const globalAgentsDest = path.join(parentDir, "AGENTS.md");
+      const agentsSpinner = ora("Copying workspace AGENTS.md...").start();
+      try {
+        if (await pathExists(globalAgentsSrc)) {
+          await copyFile(globalAgentsSrc, globalAgentsDest);
+          agentsSpinner.succeed(
+            `Copied workspace AGENTS.md → ${chalk.cyan(globalAgentsDest)}`
+          );
+        } else {
+          agentsSpinner.warn("No global AGENTS.md found in central repo (skipped)");
+        }
+      } catch (agentsErr) {
+        agentsSpinner.warn(`Could not copy workspace AGENTS.md: ${agentsErr.message}`);
+      }
+
+      // Remove the temporary central clone.
+      
+    }
   }
 
   console.log();
