@@ -11,6 +11,7 @@
   },
   "keywords": ["onboarding", "cli", "walkover"],
   "license": "MIT",
+  "files": ["bin", "hooks", "README.md"],
   "scripts": {
     "start": "node bin/walkover-onboard.js"
   },

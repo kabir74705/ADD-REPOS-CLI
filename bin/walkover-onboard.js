@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-import { checkbox, input, confirm } from "@inquirer/prompts";
+import { checkbox, input, confirm, password } from "@inquirer/prompts";
 import chalk from "chalk";
 import ora from "ora";
 import { spawn } from "node:child_process";
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, cp, rm, readdir, stat, copyFile, chmod, writeFile } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
 
 // All repos are optional and chosen by the user (gtwy-ai included).
 const REPOS = [
@@ -31,13 +33,13 @@ const REPOS = [
   },
 ];
 
-// Central repo that holds per-repo markdown docs under `<root>/<repo-name>/`.
-// This repo is NOT cloned — we only pull the relevant .md files from it.
-const CENTRAL_DOCS = {
-  owner: "kabir74705",
-  repo: "CENTRAL_REPO",
-  branch: "master",
+// Central repo that holds per-repo docs under `<root>/<repo-name>/`.
+// It is cloned in full first, then the relevant project's docs are copied
+// from the local clone into each project repo. The clone is removed afterward.
+const CENTRAL = {
+  url: "https://github.com/kabir74705/CENTRAL_REPO",
   root: "gtwy",
+  tmpName: "central-repo",
 };
 
 function printBanner() {
@@ -108,59 +110,94 @@ async function cloneRepo(repo, targetDir) {
   return dest;
 }
 
-async function fetchGithubJson(url) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "walkover-onboard-cli",
-      Accept: "application/vnd.github+json",
-    },
-  });
-  if (!res.ok) {
-    throw new Error(`GitHub API ${res.status} ${res.statusText}`);
-  }
-  return res.json();
+// Clone the whole central repo into a temporary folder and return its path.
+async function cloneCentralRepo(parentDir) {
+  const dest = path.join(parentDir, CENTRAL.tmpName);
+  await rm(dest, { recursive: true, force: true });
+  await runGit(["clone", "--depth", "1", CENTRAL.url, CENTRAL.tmpName], parentDir);
+  return dest;
 }
 
-// Pull everything under `<root>/<repoName>/` from the central repo (AGENTS.md
-// plus the docs/ folder) and mirror the same structure into the freshly cloned
-// repo directory (adding new files or replacing existing).
-async function copyDocsForRepo(repoName, repoDir) {
-  const { owner, repo, branch, root } = CENTRAL_DOCS;
-
-  // Resolve the branch tip, then read the full tree recursively so we pick up
-  // nested folders (e.g. docs/) without walking the contents API level by level.
-  const branchInfo = await fetchGithubJson(
-    `https://api.github.com/repos/${owner}/${repo}/branches/${branch}`
-  );
-  const treeSha = branchInfo.commit.commit.tree.sha;
-  const treeData = await fetchGithubJson(
-    `https://api.github.com/repos/${owner}/${repo}/git/trees/${treeSha}?recursive=1`
-  );
-
-  const prefix = `${root}/${repoName}/`;
-  const files = (treeData.tree || []).filter(
-    (entry) => entry.type === "blob" && entry.path.startsWith(prefix)
-  );
-
-  const written = [];
-  for (const file of files) {
-    const relPath = file.path.slice(prefix.length);
-    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
-
-    const res = await fetch(rawUrl, {
-      headers: { "User-Agent": "walkover-onboard-cli" },
-    });
-    if (!res.ok) {
-      throw new Error(`Failed to download ${relPath}: ${res.status}`);
-    }
-    const content = await res.text();
-
-    const dest = path.join(repoDir, relPath);
-    await mkdir(path.dirname(dest), { recursive: true });
-    await writeFile(dest, content, "utf8");
-    written.push(relPath);
+// List all files under `dir`, returned as paths relative to `dir`
+// (forward-slash separated), so we can report what was copied.
+async function listFilesRecursive(dir, base = dir) {
+  const out = [];
+  let entries;
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return out;
   }
-  return written;
+  for (const entry of entries) {
+    const abs = path.join(dir, entry);
+    const info = await stat(abs);
+    if (info.isDirectory()) {
+      out.push(...(await listFilesRecursive(abs, base)));
+    } else {
+      out.push(path.relative(base, abs).split(path.sep).join("/"));
+    }
+  }
+  return out;
+}
+
+// Copy everything under `<central>/<root>/<repoName>/` (AGENTS.md plus the
+// docs/ folder) from the local central clone into the project repo directory.
+async function copyDocsFromCentral(centralRepoPath, repoName, repoDir) {
+  const source = path.join(centralRepoPath, CENTRAL.root, repoName);
+
+  if (!(await pathExists(source))) {
+    return [];
+  }
+
+  const copied = await listFilesRecursive(source);
+  await cp(source, repoDir, { recursive: true });
+  return copied;
+}
+
+// Save the developer's GitHub token to ~/.walkover/config.json so the
+// doc-sync runner can read it at commit time (used to open PRs).
+async function saveGithubToken(token) {
+  const walkoverDir = path.join(os.homedir(), ".walkover");
+  await mkdir(walkoverDir, { recursive: true });
+  const configPath = path.join(walkoverDir, "config.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({ githubToken: token }, null, 2),
+    "utf8"
+  );
+  try {
+    await chmod(configPath, 0o600); // readable only by the user (best-effort)
+  } catch {
+    // permissions may not apply on Windows — ignore.
+  }
+}
+
+// Install the shared doc-sync runner once, in the user's home
+// (~/.walkover/sync-docs.mjs). All repos' hooks call this single copy.
+async function installGlobalRunner() {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const runnerSrc = path.join(here, "..", "hooks", "sync-docs.mjs");
+
+  const walkoverDir = path.join(os.homedir(), ".walkover");
+  await mkdir(walkoverDir, { recursive: true });
+  await copyFile(runnerSrc, path.join(walkoverDir, "sync-docs.mjs"));
+}
+
+// Install the post-commit hook into a single cloned repo. The hook just
+// calls the shared runner installed by installGlobalRunner().
+async function installRepoHook(repoDir) {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const hookSrc = path.join(here, "..", "hooks", "post-commit");
+
+  const hooksDir = path.join(repoDir, ".git", "hooks");
+  await mkdir(hooksDir, { recursive: true });
+  const hookDest = path.join(hooksDir, "post-commit");
+  await copyFile(hookSrc, hookDest);
+  try {
+    await chmod(hookDest, 0o755);
+  } catch {
+    // chmod is a no-op / may fail on Windows — the hook still runs via sh.
+  }
 }
 
 async function main() {
@@ -204,6 +241,12 @@ async function main() {
 
   const parentDir = path.resolve(parentInput.trim() || defaultParent);
 
+  const githubToken = await password({
+    message:
+      "GitHub token for doc-sync PRs (optional — press Enter to skip):",
+    mask: "*",
+  });
+
   console.log();
   console.log(chalk.bold("  All repos will live under:"));
   console.log(chalk.cyan(`    ${parentDir}`));
@@ -226,45 +269,115 @@ async function main() {
 
   await mkdir(parentDir, { recursive: true });
 
+  // Save the GitHub token (if provided) so the doc-sync runner can open PRs.
+  if (githubToken && githubToken.trim()) {
+    const tokenSpinner = ora("Saving GitHub token...").start();
+    try {
+      await saveGithubToken(githubToken.trim());
+      tokenSpinner.succeed(
+        `Saved GitHub token → ${path.join(os.homedir(), ".walkover", "config.json")}`
+      );
+    } catch (tokenErr) {
+      tokenSpinner.warn(`Could not save GitHub token: ${tokenErr.message}`);
+    }
+  } else {
+    console.log(
+      chalk.dim(
+        "  No GitHub token provided — doc-sync PRs will need a manual link.\n"
+      )
+    );
+  }
+
+  // Step 1: clone the entire central repo first (used as the docs source).
+  let centralRepoPath = null;
+  const centralSpinner = ora("Cloning central repo (docs source)...").start();
+  try {
+    centralRepoPath = await cloneCentralRepo(parentDir);
+    centralSpinner.succeed("Cloned central repo (docs source)");
+  } catch (err) {
+    centralSpinner.fail(`Could not clone central repo: ${err.message}`);
+    console.log(chalk.dim("  Docs will be skipped for all repos.\n"));
+  }
+
+  // Install the shared doc-sync runner once (not per repo).
+  const runnerSpinner = ora("Installing doc-sync runner (once)...").start();
+  let runnerInstalled = false;
+  try {
+    await installGlobalRunner();
+    runnerInstalled = true;
+    runnerSpinner.succeed("Installed doc-sync runner");
+  } catch (runnerErr) {
+    runnerSpinner.warn(
+      `Could not install doc-sync runner: ${runnerErr.message} (hooks will be skipped)`
+    );
+  }
+
   const results = [];
 
-  for (const repo of selectedRepos) {
-    const spinner = ora(
-      `Cloning ${chalk.cyan(repo.name)} into parent folder...`
-    ).start();
-    try {
-      const clonedPath = await cloneRepo(repo, parentDir);
-      spinner.succeed(`Cloned ${chalk.cyan(repo.name)} → ${clonedPath}`);
-
-      const docsSpinner = ora({
-        text: `Fetching docs for ${chalk.cyan(repo.name)} from central repo...`,
-        prefixText: "  ",
-      }).start();
+  try {
+    // Step 2: clone each selected repo, then copy its docs from the central clone.
+    for (const repo of selectedRepos) {
+      const spinner = ora(
+        `Cloning ${chalk.cyan(repo.name)} into parent folder...`
+      ).start();
       try {
-        const docs = await copyDocsForRepo(repo.name, clonedPath);
-        if (docs.length > 0) {
-          docsSpinner.succeed(
-            `Added ${docs.length} doc file(s) to ${chalk.cyan(repo.name)}`
-          );
-          for (const rel of docs) {
-            console.log(chalk.dim(`      + ${rel}`));
-          }
-        } else {
-          docsSpinner.warn(
-            `No docs found for ${chalk.cyan(repo.name)} in central repo`
-          );
-        }
-      } catch (docErr) {
-        docsSpinner.fail(
-          `Could not fetch docs for ${chalk.cyan(repo.name)}: ${docErr.message}`
-        );
-      }
+        const clonedPath = await cloneRepo(repo, parentDir);
+        spinner.succeed(`Cloned ${chalk.cyan(repo.name)} → ${clonedPath}`);
 
-      results.push({ repo, success: true, path: clonedPath });
-    } catch (err) {
-      spinner.fail(`Failed to clone ${chalk.cyan(repo.name)}`);
-      results.push({ repo, success: false, error: err.message });
+        if (centralRepoPath) {
+          const docsSpinner = ora({
+            text: `Copying docs for ${chalk.cyan(repo.name)} from central repo...`,
+            prefixText: "  ",
+          }).start();
+          try {
+            const docs = await copyDocsFromCentral(
+              centralRepoPath,
+              repo.name,
+              clonedPath
+            );
+            if (docs.length > 0) {
+              docsSpinner.succeed(
+                `Added ${docs.length} doc file(s) to ${chalk.cyan(repo.name)}`
+              );
+              for (const rel of docs) {
+                console.log(chalk.dim(`      + ${rel}`));
+              }
+            } else {
+              docsSpinner.warn(
+                `No docs found for ${chalk.cyan(repo.name)} in central repo`
+              );
+            }
+          } catch (docErr) {
+            docsSpinner.fail(
+              `Could not copy docs for ${chalk.cyan(repo.name)}: ${docErr.message}`
+            );
+          }
+        }
+
+        if (runnerInstalled) {
+          const hookSpinner = ora({
+            text: `Installing doc-sync hook for ${chalk.cyan(repo.name)}...`,
+            prefixText: "  ",
+          }).start();
+          try {
+            await installRepoHook(clonedPath);
+            hookSpinner.succeed(`Installed doc-sync hook for ${chalk.cyan(repo.name)}`);
+          } catch (hookErr) {
+            hookSpinner.warn(
+              `Could not install doc-sync hook for ${chalk.cyan(repo.name)}: ${hookErr.message}`
+            );
+          }
+        }
+
+        results.push({ repo, success: true, path: clonedPath });
+      } catch (err) {
+        spinner.fail(`Failed to clone ${chalk.cyan(repo.name)}`);
+        results.push({ repo, success: false, error: err.message });
+      }
     }
+  } finally {
+    // Step 3: remove the temporary central clone.
+   
   }
 
   console.log();

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Walkover doc-sync hook. Installed by walkover-onboard into each repo's
+# .git/hooks/post-commit. Runs the global runner after every commit.
+# Never blocks the commit (always exits 0).
+node "$HOME/.walkover/sync-docs.mjs" || true
