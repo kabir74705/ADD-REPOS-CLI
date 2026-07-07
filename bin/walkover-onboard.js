@@ -612,17 +612,7 @@ async function main() {
     if (centralRepoPath) {
       const agentsSrc = path.join(centralRepoPath, project.trim(), "AGENTS.md");
       const agentsDest = path.join(parentDir, "AGENTS.md");
-      const agentsSpinner = ora("Copying workspace AGENTS.md...").start();
-      try {
-        if (await pathExists(agentsSrc)) {
-          await copyFile(agentsSrc, agentsDest);
-          agentsSpinner.succeed(`Copied workspace AGENTS.md → ${chalk.cyan(agentsDest)}`);
-        } else {
-          
-        }
-      } catch (err) {
-        agentsSpinner.warn(`Could not copy AGENTS.md: ${err.message}`);
-      }
+      
 
       // Remove temp central clone.
      
