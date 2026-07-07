@@ -26,7 +26,19 @@ const CENTRAL = {
   repo: "CENTRAL_REPO",
   url: "https://github.com/kabir74705/CENTRAL_REPO",
   base: "master",
-  root: "gtwy",
+  // "project" is the folder inside CENTRAL_REPO where this project's docs live.
+  // It is written by the CLI to ~/.walkover/config.json when the developer ran
+  // walkover-onboard. Falls back to "gtwy" so old setups keep working.
+  root: (() => {
+    try {
+      const cfg = JSON.parse(
+        readFileSync(path.join(os.homedir(), ".walkover", "config.json"), "utf8")
+      );
+      return cfg.project || "gtwy";
+    } catch {
+      return "gtwy";
+    }
+  })(),
 };
 
 // Which committed paths count as docs that mirror into the central repo.
