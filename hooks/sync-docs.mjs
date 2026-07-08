@@ -42,7 +42,7 @@ const CENTRAL = {
 };
 
 // Which committed paths count as docs that mirror into the central repo.
-const DOC_ROOTS = ["AGENTS.md", "docs/",".agent"];
+const DOC_ROOTS = ["AGENTS.md", "docs/",".agent/rules"];
 
 const CENTRAL_CLONE = path.join(os.homedir(), ".walkover", "CENTRAL_REPO");
 
