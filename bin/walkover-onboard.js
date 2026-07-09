@@ -181,7 +181,7 @@ async function installCodeGraphMcp(clonedPath, ide, centralRepoPath) {
   const { path: targetRelPath, format } = mod.default;
   const patchedFormat = patchMcpFormatForRunner(format);
 
-  const targetPath = path.join(clonedPath, targetRelPath);
+  const targetPath = path.join(os.homedir(), targetRelPath);
   await mkdir(path.dirname(targetPath), { recursive: true });
   await writeFile(targetPath, JSON.stringify(patchedFormat, null, 2) + "\n", "utf8");
   return targetRelPath;
